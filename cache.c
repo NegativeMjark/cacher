@@ -1,6 +1,3 @@
-
-#include "sha256.c"
-
 #ifndef NOLIBC
 #define _GNU_SOURCE
 #include <errno.h>
@@ -15,6 +12,8 @@
 #include <time.h>
 #include <unistd.h>
 #endif
+
+#include "sha256.c"
 
 #if STDIN_FILENO != 0
 /*
@@ -84,7 +83,7 @@ static void copy_file(int src, int dst, ssize_t count)
 {
 	struct stat dst_stat;
 
-	check_call(fstat(dst, &dst_stat), "fstat");
+	checked(fstat, (dst, &dst_stat));
 
 	while (count > 0)
 	{
@@ -151,12 +150,21 @@ static char filenames[HASH_LEN * 2 + 1 + HASH_LEN * 2 + 1];
 static char * const cache_filename = filenames + HASH_LEN * 2 + 1;
 static char * const lock_filename = filenames + HASH_LEN * 2;
 static char * const tmp_filename = filenames;
-static struct stat cache_stat;
+
+struct cache_file_header
+{
+	struct timespec create_time_start;
+	struct timespec create_time_end;
+	size_t args_len;
+	char args[];
+};
+
 static struct flock lock_flock;
-static struct timespec times[2];
+static struct stat file_stat;
+static struct timespec time_now;
+static struct cache_file_header new_file_header;
 
-
-void main_check_for_cache(int cache_dir_fd, int lock_fd, time_t cache_duration)
+void main_check_for_cache(int cache_dir_fd, int lock_fd, time_t cache_duration, char * args, size_t args_len)
 {
 	int cache_file_fd = openat(
 		cache_dir_fd,
@@ -166,27 +174,50 @@ void main_check_for_cache(int cache_dir_fd, int lock_fd, time_t cache_duration)
 	);
 	if (cache_file_fd != -1)
 	{
-		checked(fstat, (cache_file_fd, &cache_stat));
+		size_t header_size = sizeof(struct cache_file_header) + args_len;
+
+		checked(fstat, (cache_file_fd, &file_stat));
+		if (file_stat.st_size < header_size)
+		{
+			return;
+		}
+
+		struct cache_file_header const * header = (struct cache_file_header const *) check_alloc(mmap(
+			NULL,
+			header_size,
+			PROT_READ,
+			MAP_SHARED | MAP_POPULATE,
+			cache_file_fd,
+			0
+		), "mmap");
 
 		if (cache_duration > 0)
 		{
-			checked(clock_gettime, (CLOCK_TAI, &times[0]));
-			if ((times[0].tv_sec > cache_stat.st_mtim.tv_sec + cache_duration)
-				|| ((times[0].tv_sec == cache_stat.st_mtim.tv_sec + cache_duration)
-					&& times[0].tv_nsec > cache_stat.st_mtim.tv_nsec ))
+			checked(clock_gettime, (CLOCK_TAI, &time_now));
+
+			if (time_now.tv_sec > header->create_time_end.tv_sec + cache_duration)
 			{
 				return;
 			}
 		}
 
-		/* Fast path for cached file */
+		if (header->args_len != args_len || memcmp(header->args, args, args_len) != 0)
+		{
+			/** This is pretty unlikely, but might as well double check we haven't got a hash collision. */
+			return;
+		}
+
 		if (lock_fd != -1)
 		{
+			/* If we are checking for a cache file while holding a lock, it's now safe to release it.
+             * This is a optimisation to free up the other readers that were blocked on getting the lock.
+             */
 			lock_flock.l_type = F_UNLCK;
 			checked(fcntl, (lock_fd, F_SETLK, &lock_flock));
 		}
 
-		copy_file(cache_file_fd, STDOUT_FILENO, cache_stat.st_size);
+		lseek(cache_file_fd, header_size, SEEK_SET);
+		copy_file(cache_file_fd, STDOUT_FILENO, file_stat.st_size - header_size);
 		exit(0);
 	}
 
@@ -251,7 +282,7 @@ extern char **environ;
 
 int main(int argc, char * const * const argv)
 {
-	if (argc < CACHE_ARGS)
+	if (argc < CACHE_ARGS + 1)
 	{
 		ssize_t result = 2;
 		result |= write_const(STDERR_FILENO, "usage: ");
@@ -264,16 +295,46 @@ int main(int argc, char * const * const argv)
 
 	time_t cache_duration = main_parse_duration(argv[2]);
 
-	sha256_init(&ctx);
+	char * args = argv[CACHE_ARGS];
+	char * next_arg = args;
+	size_t args_len = 0;
 	for (int i = CACHE_ARGS; i < argc; i++)
 	{
-		sha256_update(&ctx, argv[i], 1 + strlen(argv[i]));
+		if (next_arg != argv[i])
+		{
+			args = NULL;
+		}
+		size_t len = strlen(argv[i]) + 1;
+		args_len += len;
+		next_arg = argv[i] + len;
 	}
+
+	if (args == NULL)
+	{
+		args = (char *) check_alloc(mmap(
+			NULL,
+			args_len,
+			PROT_READ | PROT_WRITE,
+			MAP_ANONYMOUS | MAP_PRIVATE,
+			-1,
+			0
+		), "mmap");
+		next_arg = args;
+		for (int i = CACHE_ARGS; i < argc; i++)
+		{
+			size_t len = strlen(argv[i]) + 1;
+			memcpy(next_arg, argv[i], len);
+			next_arg += len;
+		}
+	}
+
+	sha256_init(&ctx);
+	sha256_update(&ctx, args, args_len);
 	sha256_final(&ctx, hash);
 
 	hex(hash, cache_filename, HASH_LEN);
 
-	main_check_for_cache(cache_dir_fd, -1, cache_duration);
+	main_check_for_cache(cache_dir_fd, -1, cache_duration, args, args_len);
 
 	lock_filename[0] = '_';
 	int lock_fd = checked(openat, (
@@ -285,7 +346,7 @@ int main(int argc, char * const * const argv)
 	lock_flock.l_len = 1;
 	checked(fcntl, (lock_fd, F_SETLKW, &lock_flock));
 
-	main_check_for_cache(cache_dir_fd, lock_fd, cache_duration);
+	main_check_for_cache(cache_dir_fd, lock_fd, cache_duration, args, args_len);
 
 	checked(getrandom, (hash, HASH_LEN, 0));
 	hex(hash, tmp_filename, HASH_LEN);
@@ -293,7 +354,7 @@ int main(int argc, char * const * const argv)
 	int pipefds[2];
 	checked(pipe2, (pipefds, 0));
 
-	checked(clock_gettime, (CLOCK_TAI, &times[0]));
+	checked(clock_gettime, (CLOCK_TAI, &new_file_header.create_time_start));
 
 	pid_t child_pid = checked(fork, ());
 	if (child_pid == 0)
@@ -310,17 +371,20 @@ int main(int argc, char * const * const argv)
 	checked(close, (STDIN_FILENO));
 	int output_fd = checked(openat, (cache_dir_fd, ".", O_TMPFILE | O_RDWR, S_IRUSR));
 
+	new_file_header.args_len = args_len;
+	checked(write, (output_fd, &new_file_header, sizeof(struct cache_file_header)));
+	checked(write, (output_fd, args, args_len));
+
+	ssize_t total_copied = 0;
 	while (1)
 	{
 		ssize_t copied = checked(splice, (pipefds[0], NULL, output_fd, NULL, COPY_BUFFER_SIZE, 0));
+		total_copied += copied;
 
 		if (copied == 0)
 		{
 			break;
 		}
-
-		checked(lseek, (output_fd, -copied, SEEK_CUR));
-		copy_file(output_fd, STDOUT_FILENO, copied);
 	}
 
 	siginfo_t child_info;
@@ -330,11 +394,10 @@ int main(int argc, char * const * const argv)
 	{
 		if (child_info.si_status == 0)
 		{
-			checked(unlinkat, (
-				cache_dir_fd,
-				lock_filename,
-				0
-			));
+			checked(clock_gettime, (CLOCK_TAI, &new_file_header.create_time_end));
+
+			checked(lseek, (output_fd, 0, SEEK_SET));
+			checked(write, (output_fd, &new_file_header, sizeof(struct cache_file_header)));
 
 			checked(linkat, (
 				AT_FDCWD,
@@ -344,15 +407,24 @@ int main(int argc, char * const * const argv)
 				AT_SYMLINK_FOLLOW
 			));
 
-			checked(clock_gettime, (CLOCK_TAI, &times[1]));
-			checked(futimens, (output_fd, times));
-
 			checked(renameat, (
 				cache_dir_fd,
 				tmp_filename,
 				cache_dir_fd,
 				cache_filename
 			));
+
+			checked(unlinkat, (
+				cache_dir_fd,
+				lock_filename,
+				0
+			));
+
+			lock_flock.l_type = F_UNLCK;
+			checked(fcntl, (lock_fd, F_SETLK, &lock_flock));
+
+			checked(lseek, (output_fd, sizeof(struct cache_file_header) + args_len, SEEK_SET));
+			copy_file(output_fd, STDOUT_FILENO, total_copied);
 		}
 		return child_info.si_status;
 	}
